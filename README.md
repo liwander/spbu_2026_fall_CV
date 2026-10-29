@@ -73,16 +73,17 @@ uv run python hw3/circles.py
 
 ### 4. Сшивка кадров в панораму
 
-Метод с практического занятия (lab04): ключевые точки ORB, сопоставление
-BFMatcher с `NORM_HAMMING` и проверкой отношения расстояний, гомография по
-RANSAC и перенос кадров через `warpPerspective`. Для повторяющихся фасадов
-цепочка гомографий неустойчива, поэтому при необходимости группа сшивается
-преобразованием подобия по тем же соответствиям.
+Два решения. Первое (`lab04`) повторяет метод с практического занятия: ORB,
+BFMatcher с `NORM_HAMMING`, Lowe ratio 0.6, гомография по RANSAC и перенос
+через `warpPerspective`. Второе (`sift`) использует SIFT, `NORM_L2`, ratio 0.75
+и преобразование подобия. Оба варианта смешивают кадры с плавными весами.
 
-Подробное описание метода и результатов — в [hw4/README.md](hw4/README.md).
+Подробное описание методов и результатов — в [hw4/README.md](hw4/README.md).
 
 ```sh
-uv run python hw4/panorama.py
+uv run python hw4/panorama.py              # оба метода
+uv run python hw4/panorama.py --method lab04
+uv run python hw4/panorama.py --method sift
 ```
 
-Скрипт сохраняет три панорамы в `hw4/output/`.
+Скрипт сохраняет панорамы в `hw4/output/lab04/` и `hw4/output/sift/`.

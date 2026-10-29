@@ -1,8 +1,8 @@
-image,circles,param2,min_dist,min_radius,max_radius,min_brightness
-logs-1.jpg,67,38,45,15,75,115
-logs-2.jpg,67,38,45,15,75,115
-logs-3.jpg,42,28,14,6,18,
-logs-4.jpg,51,30,22,12,45,110
-pipes-4.jpg,73,28,20,10,26,
-pipes-5.jpg,20,40,45,18,60,
-pipes-6.jpg,18,45,110,50,110,
+image,circles,method,param2,min_dist,min_radius,max_radius
+logs-1.jpg,65,alt,0.6,45,15,75
+logs-2.jpg,56,alt,0.6,45,15,75
+logs-3.jpg,52,alt,0.65,14,6,18
+logs-4.jpg,33,alt,0.55,22,12,45
+pipes-4.jpg,54,alt,0.55,20,10,26
+pipes-5.jpg,20,gradient,40,45,18,60
+pipes-6.jpg,22,alt,0.6,110,50,110

@@ -11,6 +11,8 @@
    ``estimateAffinePartial2D`` (подобие, RANSAC) -> ``warpPerspective``.
 
 Оба метода смешивают кадры с весами по расстоянию до края кадра (feathering).
+Опорным кадром выбирается центральный: ошибка накапливается в обе стороны от
+него, поэтому панорама меньше заваливается и наклон уменьшается.
 """
 
 from __future__ import annotations
@@ -129,6 +131,13 @@ def _canvas_size(images, transforms):
     height = int(np.ceil(ymax - ymin))
     if width * height > MAX_PIXELS:
         return None
+
+    # Полотно не должно быть заметно больше суммы кадров: иначе цепочка
+    # преобразований «разъехалась» и панорама растянута.
+    total_width = sum(image.shape[1] for image in images)
+    max_height = max(image.shape[0] for image in images)
+    if width > 1.1 * total_width or height > 2.5 * max_height:
+        return None
     return width, height, xmin, ymin
 
 
@@ -144,14 +153,27 @@ def _plan(images, features, config):
                           S=S, s_inliers=s_inliers))
 
     def chain(key: str):
-        transforms = [np.eye(3, dtype=np.float64)]
-        for i, pair in enumerate(pairs, start=1):
-            matrix = pair[key]
+        """Матрицы к опорному кадру. Опорный — центральный, ошибка идёт в обе стороны."""
+        reference = len(images) // 2
+        transforms = [None] * len(images)
+        transforms[reference] = np.eye(3, dtype=np.float64)
+
+        for i in range(reference + 1, len(images)):
+            matrix = pairs[i - 1][key]
             if matrix is None:
                 return None
-            transforms.append(transforms[-1] @ matrix)
-            if not _sane(transforms[-1], images[i].shape):
+            transforms[i] = transforms[i - 1] @ matrix
+            if not _sane(transforms[i], images[i].shape):
                 return None
+
+        for i in range(reference - 1, -1, -1):
+            matrix = pairs[i][key]  # переводит кадр i+1 в i
+            if matrix is None:
+                return None
+            transforms[i] = transforms[i + 1] @ np.linalg.inv(matrix)
+            if not _sane(transforms[i], images[i].shape):
+                return None
+
         if _canvas_size(images, transforms) is None:
             return None
         return transforms

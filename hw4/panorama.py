@@ -1,24 +1,28 @@
 """Сшивка кадров в панораму.
 
-Для каждой группы снимков (`building1`, `building2`, `building3`) кадры
-последовательно сопоставляются друг с другом:
+Метод с практического занятия (lab04):
 
-1. на каждом кадре ищутся ключевые точки SIFT;
-2. дескрипторы соседних кадров сопоставляются BFMatcher с проверкой отношения
-   расстояний (Lowe ratio test);
-3. по найденным соответствиям оценивается преобразование подобия
-   (`estimateAffinePartial2D`: поворот, масштаб, сдвиг) с RANSAC;
-4. преобразования пересчитываются в систему координат первого кадра, все кадры
-   переводятся на общее полотно;
-5. кадры смешиваются с весами по расстоянию до края (feathering), чтобы швы
-   были незаметны.
+1. ORB (`nfeatures=2000`) находит ключевые точки и дескрипторы.
+2. `BFMatcher` с `NORM_HAMMING` сопоставляет дескрипторы соседних кадров
+   (`knnMatch`, k=2).
+3. Пары фильтруются проверкой отношения расстояний (Lowe ratio test, 0.6).
+4. По хорошим соответствиям оценивается гомография
+   `cv2.findHomography(..., cv2.RANSAC, 5.0)`.
+5. Кадры переносятся на общее полотно через `cv2.warpPerspective` и
+   смешиваются.
 
-Почему подобие, а не полная гомография. Фасады зданий состоят из повторяющихся
-окон, и `findHomography` на таких соответствиях легко «уводит» перспективные
-члены: углы кадра уезжают на десятки тысяч пикселей, а полотно разрастается до
-неприемлемых размеров. Камера при съёмке движется примерно параллельно фасаду,
-поэтому поворота, масштаба и сдвига достаточно; такая модель устойчива и не
-даёт ложной перспективы.
+Для группы из нескольких кадров гомографии соседних пар перемножаются в
+систему координат первого кадра.
+
+Отдельно про устойчивость. Фасады зданий состоят из повторяющихся окон, и
+полная гомография на таких соответствиях часто получает лишние перспективные
+члены: у матрицы появляется полюс рядом с кадром, углы уезжают на десятки
+тысяч пикселей, а полотно раздувается до гигабайтов. Поэтому после оценки
+всей цепочки гомографий выполняется проверка её корректности. Если цепочка
+неустойчива, группа сшивается преобразованием подобия (поворот, равномерный
+масштаб, сдвиг) — это частный случай гомографии, и он оценивается по тем же
+самым соответствиям через `cv2.estimateAffinePartial2D`. Такой вариант
+устойчив и не даёт ложной перспективы.
 """
 
 from __future__ import annotations
@@ -29,44 +33,66 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-# Отношение расстояний для Lowe ratio test.
-RATIO = 0.75
-# Порог RANSAC при оценке преобразования, пиксели.
-RANSAC_THRESH = 3.0
+# Параметры из практического занятия.
+ORB_FEATURES = 2000
+RATIO = 0.6
+RANSAC_THRESH = 5.0
+
 # Минимум соответствий, чтобы доверять преобразованию.
 MIN_MATCHES = 10
 # Предохранитель от абсурдно большого полотна.
 MAX_PIXELS = 80_000_000
+# Допустимый разброс размера кадра после преобразования.
+SPAN_LOW, SPAN_HIGH = 0.25, 5.0
 
 
-def _features(sift, image: np.ndarray):
+def _features(orb, image: np.ndarray):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    return sift.detectAndCompute(gray, None)
+    return orb.detectAndCompute(gray, None)
 
 
-def _transform(feat_a, feat_b):
-    """Преобразование подобия, переводящее кадр b в систему координат кадра a."""
-    kp_a, desc_a = feat_a
-    kp_b, desc_b = feat_b
+def _good_matches(feat_a, feat_b):
+    """Хорошие соответствия: для точек кадра b находятся точки кадра a."""
+    _, desc_a = feat_a
+    _, desc_b = feat_b
     if desc_a is None or desc_b is None:
-        return None
+        return []
 
-    matcher = cv2.BFMatcher(cv2.NORM_L2)
+    matcher = cv2.BFMatcher_create(cv2.NORM_HAMMING)
     knn = matcher.knnMatch(desc_b, desc_a, k=2)
-    good = [pair[0] for pair in knn
+    return [pair[0] for pair in knn
             if len(pair) == 2 and pair[0].distance < RATIO * pair[1].distance]
-    if len(good) < MIN_MATCHES:
-        return None
 
-    src = np.float32([kp_b[m.queryIdx].pt for m in good])
-    dst = np.float32([kp_a[m.trainIdx].pt for m in good])
+
+def _points(feat_a, feat_b, matches):
+    kp_a, _ = feat_a
+    kp_b, _ = feat_b
+    src = np.float32([kp_b[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+    dst = np.float32([kp_a[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+    return src, dst
+
+
+def _homography(feat_a, feat_b, matches):
+    """Гомография, переводящая кадр b в систему координат кадра a."""
+    if len(matches) < MIN_MATCHES:
+        return None, 0
+    src, dst = _points(feat_a, feat_b, matches)
+    matrix, inliers = cv2.findHomography(src, dst, cv2.RANSAC, RANSAC_THRESH)
+    return matrix, 0 if inliers is None else int(inliers.sum())
+
+
+def _similarity(feat_a, feat_b, matches):
+    """Преобразование подобия b -> a на тех же соответствиях."""
+    if len(matches) < MIN_MATCHES:
+        return None, 0
+    src, dst = _points(feat_a, feat_b, matches)
     matrix, inliers = cv2.estimateAffinePartial2D(
         src, dst, method=cv2.RANSAC, ransacReprojThreshold=RANSAC_THRESH,
         confidence=0.999, maxIters=5000,
     )
     if matrix is None:
-        return None
-    return np.vstack([matrix, [0, 0, 1]]), len(good), int(inliers.sum())
+        return None, 0
+    return np.vstack([matrix, [0, 0, 1]]), int(inliers.sum())
 
 
 def _corners(shape) -> np.ndarray:
@@ -74,32 +100,48 @@ def _corners(shape) -> np.ndarray:
     return np.float32([[0, 0], [w, 0], [w, h], [0, h]]).reshape(-1, 1, 2)
 
 
-def stitch(paths: list[Path]) -> tuple[np.ndarray, list[tuple[int, int]]]:
-    """Сшить кадры в панораму. Вернуть панораму и статистику по парам."""
-    images = []
-    for path in paths:
-        image = cv2.imread(str(path))
-        if image is None:
-            raise IOError(f"не удалось прочитать файл: {path}")
-        images.append(image)
+def _sane(matrix: np.ndarray, shape) -> bool:
+    """Проверить, что преобразование не раздувает кадр до абсурда."""
+    if matrix is None or matrix.shape != (3, 3):
+        return False
+    projected = cv2.perspectiveTransform(_corners(shape), matrix).reshape(-1, 2)
+    if not np.isfinite(projected).all():
+        return False
+    h, w = shape[:2]
+    span_w = projected[:, 0].max() - projected[:, 0].min()
+    span_h = projected[:, 1].max() - projected[:, 1].min()
+    return (SPAN_LOW * w < span_w < SPAN_HIGH * w
+            and SPAN_LOW * h < span_h < SPAN_HIGH * h)
 
-    sift = cv2.SIFT_create()
-    features = [_features(sift, image) for image in images]
 
-    # Преобразования каждого кадра в систему координат первого.
-    transforms = [np.eye(3, dtype=np.float64)]
-    stats = []
+def _plan(images, features):
+    """Выбрать модель преобразования и построить матрицы к первому кадру."""
+    pairs = []
     for i in range(1, len(images)):
-        result = _transform(features[i - 1], features[i])
-        if result is None:
-            raise RuntimeError(
-                f"не удалось сопоставить {paths[i - 1].name} и {paths[i].name}"
-            )
-        matrix, matches, inliers = result
-        transforms.append(transforms[-1] @ matrix)
-        stats.append((matches, inliers))
+        matches = _good_matches(features[i - 1], features[i])
+        H, h_inliers = _homography(features[i - 1], features[i], matches)
+        S, s_inliers = _similarity(features[i - 1], features[i], matches)
+        pairs.append((len(matches), h_inliers, s_inliers, H, S))
 
-    # Границы общего полотна.
+    for model, index in (("homography", 3), ("similarity", 4)):
+        transforms = [np.eye(3, dtype=np.float64)]
+        valid = True
+        for i, pair in enumerate(pairs, start=1):
+            matrix = pair[index]
+            if matrix is None:
+                valid = False
+                break
+            transforms.append(transforms[-1] @ matrix)
+            if not _sane(transforms[-1], images[i].shape):
+                valid = False
+                break
+        if valid and _canvas_size(images, transforms) is not None:
+            return model, transforms, pairs
+
+    raise RuntimeError("не удалось подобрать устойчивое преобразование")
+
+
+def _canvas_size(images, transforms):
     projected = [cv2.perspectiveTransform(_corners(image.shape), matrix)
                  for image, matrix in zip(images, transforms)]
     points = np.concatenate(projected)
@@ -108,8 +150,24 @@ def stitch(paths: list[Path]) -> tuple[np.ndarray, list[tuple[int, int]]]:
     width = int(np.ceil(xmax - xmin))
     height = int(np.ceil(ymax - ymin))
     if width * height > MAX_PIXELS:
-        raise RuntimeError(f"полотно слишком большое: {width}x{height}")
+        return None
+    return width, height, xmin, ymin
 
+
+def stitch(paths: list[Path]):
+    """Сшить кадры в панораму. Вернуть панораму, модель и статистику."""
+    images = []
+    for path in paths:
+        image = cv2.imread(str(path))
+        if image is None:
+            raise IOError(f"не удалось прочитать файл: {path}")
+        images.append(image)
+
+    orb = cv2.ORB_create(nfeatures=ORB_FEATURES)
+    features = [_features(orb, image) for image in images]
+    model, transforms, pairs = _plan(images, features)
+
+    width, height, xmin, ymin = _canvas_size(images, transforms)
     shift = np.array([[1, 0, -xmin], [0, 1, -ymin], [0, 0, 1]], dtype=np.float64)
 
     # Взвешенное смешивание по расстоянию до края кадра.
@@ -130,12 +188,11 @@ def stitch(paths: list[Path]) -> tuple[np.ndarray, list[tuple[int, int]]]:
     panorama = accumulator / np.maximum(weights, 1e-6)[..., None]
     panorama = panorama.clip(0, 255).astype(np.uint8)
 
-    # Обрезать пустые поля.
     ys, xs = np.where(weights > 1e-3)
     if len(ys) and len(xs):
         panorama = panorama[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
 
-    return panorama, stats
+    return panorama, model, pairs
 
 
 def main() -> None:
@@ -157,13 +214,15 @@ def main() -> None:
         if len(paths) < 2:
             continue
 
-        panorama, stats = stitch(paths)
+        panorama, model, pairs = stitch(paths)
         out_path = args.out / f"{group.name}_panorama.jpg"
         cv2.imwrite(str(out_path), panorama, [cv2.IMWRITE_JPEG_QUALITY, 92])
 
-        print(f"{group.name}: {len(paths)} кадров -> {panorama.shape[1]}x{panorama.shape[0]}")
-        for i, (matches, inliers) in enumerate(stats, start=1):
-            print(f"  пара {i - 1}-{i}: {matches} соответствий, {inliers} инлайеров")
+        print(f"{group.name}: {len(paths)} кадров -> {panorama.shape[1]}x{panorama.shape[0]}"
+              f" ({model})")
+        for i, (matches, h_inliers, s_inliers, _, _) in enumerate(pairs, start=1):
+            print(f"  пара {i - 1}-{i}: {matches} соответствий, "
+                  f"гомография {h_inliers}, подобие {s_inliers}")
 
 
 if __name__ == "__main__":
